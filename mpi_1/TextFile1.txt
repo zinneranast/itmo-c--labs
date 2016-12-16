@@ -1,0 +1,275 @@
+#pragma comment (lib, "C:\\Sources\\itmo-c++labs\\mpi_1\\msmpi.lib")
+#include <stdio.h>
+#include <stdlib.h>
+#include <iostream>
+#include <fstream>
+#include <math.h>
+#include <vector>
+#include "mpi.h"
+
+#define ROOT (0)
+
+void GenerateMatrix(const char *fileName, int n) {
+	ofstream file;
+
+	try {
+		file.open(fileName);
+		file << n << " " << n + 1 << endl;
+		for (int i = 0; i < n; i++){
+			for (int j = 0; j < n + 1; j++) {
+				if (i != j)
+					file << (rand() % 200 - 100)*0.0001 << " ";
+				else
+					file << n << " ";
+			}
+			file << endl;
+		}
+
+	}
+	catch (exception &e) {
+		printf("Error: Invalid file path\n", fileName);
+	}
+}
+
+void GenerateApproximationMatrix(const char *fileName, int n) {
+	ofstream file;
+
+	try {
+		file.open(fileName);
+		file << n << endl;
+		for (int i = 0; i < n; i++)
+			file << (rand() % 200 - 100)*0.0001 << endl;
+	}
+	catch (exception &e) {
+		printf("Error: Invalid file path\n", fileName);
+	}
+}
+
+void ReadMatrix(const char *fileName, vector<vector<double>> &a, vector<double> &b) {
+	int n, m;
+	ifstream file;
+
+	try {
+		file.open(fileName);
+		file >> n >> m;
+		if (n < 0 || m != n + 1)
+			throw new exception("Error: Invalid matrix dimensions\n");
+
+		for (int i = 0; i < n; i++)
+			for (int j = 0; j < n; j++) {
+				file >> a[i][j];
+				if (j == n - 1) file >> b[i];
+			}
+
+		file.close();
+	}
+	catch (exception &e) {
+		printf("Error: File %s does not exist\n", fileName);
+	}
+}
+
+void ReadApproximationMatrix(const char *fileName, vector<double> &x) {
+	int n;
+	ifstream file;
+
+	try {
+		file.open(fileName);
+		file >> n;
+		if (n < 0)
+			throw new exception("Error: Invalid matrix dimensions\n");
+
+		for (int i = 0; i < n; i++)
+			file >> x[i];
+
+		file.close();
+	}
+	catch (exception &e) {
+		printf("Error: File %s does not exist\n", fileName);
+	}
+}
+
+void WriteResult(const char *fileName, vector<double> &x) {
+	int n = x.size();
+	ofstream file;
+
+	try {
+		file.open(fileName);
+		for (int i = 0; i < n; i++)
+			file << x[i] << endl;
+	}
+	catch (exception &e) {
+		printf("Error: Invalid file path\n", fileName);
+	}
+}
+
+bool Check(vector<vector<double>> &a) {
+	int n = a.size();
+	double sum = 0;
+
+	for (int i = 0; i < n; i++) {
+		for (int j = 0; j < n; j++) {
+			if (i != j)
+				sum += fabs(a[i][j]);
+			if (i == j && a[i][j] == 0)
+				return false;
+		}
+		if (a[i][i] < sum)
+			return false;
+		sum = 0;
+	}
+
+	return true;
+}
+
+void jacobi_iter(double *A, double *x, double *x_old, int n_part, int n, int first)
+{
+	int i, j;
+	double sum;
+
+	for (i = 0; i < n_part; i++) {
+		sum = 0;
+		for (j = 0; j < i + first; j++) {
+			sum += A[i*(n + 1) + j] * x_old[j];
+		}
+
+		for (j = i + first + 1; j < n; j++) {
+			sum += A[i*(n + 1) + j] * x_old[j];
+		}
+
+		x[i + first] = (A[i*(n + 1) + n] - sum) / A[i*(n + 1) + i + first];
+	}
+}
+
+unsigned jacobi_solve(double *A, double *x, double e, int n, int rank, int n_part, int size)
+{
+	double *x_old;
+	int i, iter = 0, first;
+	double d_norm, d_val;
+	int *sendcnts, *displs;
+
+	displs = (int*)malloc(size*sizeof(int));
+	sendcnts = (int*)malloc(size*sizeof(int));
+
+	MPI_Scan(&n_part, &first, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+	first -= n_part;
+
+	MPI_Allgather(&n_part, 1, MPI_INT, sendcnts, 1, MPI_INT, MPI_COMM_WORLD);
+	displs[0] = 0;
+	for (i = 1; i < size; i++) displs[i] = displs[i - 1] + sendcnts[i - 1];
+
+	x_old = new_vector(n);
+
+	do {
+		iter++;
+
+		memcpy(x_old, x, sizeof(double)*n);
+
+		jacobi_iter(A, x, x_old, n_part, n, first);
+
+		// TODO Gatherv?
+		MPI_Allgatherv(x + first, n_part, MPI_DOUBLE, x, sendcnts, displs, MPI_DOUBLE, MPI_COMM_WORLD);
+
+		d_norm = 0;
+		if (rank == ROOT) {
+			for (i = 0; i < n; i++) {
+				d_val = fabs(x[i] - x_old[i]);
+				if (d_norm < d_val) d_norm = d_val;
+			}
+		}
+
+		MPI_Bcast(&d_norm, 1, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+
+	} while (e < d_norm);
+
+	free(x_old);
+
+	return iter;
+}
+
+int main(int argc, char **argv)
+{
+	double *A, *A_part, *x;
+	int i, n, n_part, part_size, iter, rank, size;
+	double error = 0.1e-10;
+	int *sendcnts, *displs;
+	double t_start, t_end;
+	char processor_name[MPI_MAX_PROCESSOR_NAME];
+	int namelen;
+
+	MPI_Init(&argc, &argv);
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Get_processor_name(processor_name, &namelen);
+
+	printf("process %i on %s\n", rank, processor_name);
+
+	scanf("%u", &n);
+	MPI_Bcast(&n, 1, MPI_INT, ROOT, MPI_COMM_WORLD);
+	MPI_Bcast(&error, 1, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+
+	if (rank == ROOT) {
+		t_start = MPI_Wtime();
+		A = new_matrix(n, n + 1);
+		read_matrix(A, n, n + 1); t_end = MPI_Wtime();
+		printf("Time to input matrix: %f sec\n", t_end - t_start);
+	}
+
+	x = new_vector(n);
+	MPI_Bcast(x, n, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+
+	n_part = (n / size) + (n%numprocs > rank ? 1 : 0);
+
+	printf("process: %i; num of rows: %i\n", rank, n_part);
+
+	A_part = new_matrix(n_part, n + 1);
+
+	displs = (int*)malloc(numprocs*sizeof(int));
+	sendcnts = (int*)malloc(numprocs*sizeof(int));
+
+	part_size = (n + 1) * n_part;
+	MPI_Gather(&part_size, 1, MPI_INT, sendcnts, 1, MPI_INT, ROOT, MPI_COMM_WORLD);
+
+	displs[0] = 0;
+	for (i = 1; i < numprocs; i++) displs[i] = displs[i - 1] + sendcnts[i - 1];
+
+	if (rank == ROOT) {
+		printf("#%i, %p: ", rank, A_part); write_matrix(A_part, n_part, n + 1);
+		printf("part_size #%i - %i\n", rank, part_size);
+		printf("sendcnts #%i: ", rank); for (i = 0; i < numprocs; i++) printf("%i\n", sendcnts[i]);
+		printf("displs #%i: ", rank); for (i = 0; i < numprocs; i++) printf("%i\n", displs[i]);
+		printf("A #%i: ", rank); write_matrix(A, n, n + 1);
+	}
+
+	t_start = MPI_Wtime();
+
+	MPI_Scatterv(A, sendcnts, displs, MPI_DOUBLE, A_part, part_size, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+
+	printf("#%i: ", rank); write_matrix(A_part, n_part, n + 1);
+
+	t_end = MPI_Wtime();
+	if (rank == ROOT) printf("Time to scatter matrix to all processors: %f sec\n", t_end - t_start);
+
+	t_start = MPI_Wtime();
+	iter = jacobi_solve(A_part, x, error, n, rank, n_part, numprocs);
+	t_end = MPI_Wtime();
+	if (rank == ROOT) printf("Time to solve equation: %f sec\n", t_end - t_start);
+
+	if (rank == ROOT) {
+		printf("iter %i\n", iter);
+		printf("ans = \n");
+		write_vector(x, n);
+	}
+
+	if (rank == ROOT) {
+		free_matrix(A);
+	}
+
+	free(x);
+	free_matrix(A_part);
+	free(sendcnts);
+	free(displs);
+
+	MPI_Finalize();
+
+	return EXIT_SUCCESS;
+}
